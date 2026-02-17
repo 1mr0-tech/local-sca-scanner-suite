@@ -1,0 +1,343 @@
+#!/usr/bin/env bash
+
+###############################################################################
+# add-to-environment
+#
+# Makes scan-repo available as a command from any directory by placing it on
+# the system PATH. Run this if scan-repo is not yet accessible as a command,
+# or if you skipped the full install.sh.
+#
+# Usage:
+#   ./add-to-environment [OPTIONS]
+#
+# Options:
+#   --system    Install to /usr/local/bin (system-wide, requires sudo/root)
+#   --user      Install to ~/.local/bin   (current user only, no sudo needed)
+#   -y, --yes   Skip confirmation prompt
+#   -h, --help  Show this help
+#
+# With no options the script auto-selects: system if sudo is available,
+# user-local otherwise.
+###############################################################################
+
+set -euo pipefail
+
+###############################################################################
+# Colours
+###############################################################################
+
+if [ -t 1 ] && command -v tput >/dev/null 2>&1 && tput colors >/dev/null 2>&1; then
+    RED=$(tput setaf 1); GREEN=$(tput setaf 2); YELLOW=$(tput setaf 3)
+    BLUE=$(tput setaf 4); CYAN=$(tput setaf 6); BOLD=$(tput bold); RESET=$(tput sgr0)
+else
+    RED=""; GREEN=""; YELLOW=""; BLUE=""; CYAN=""; BOLD=""; RESET=""
+fi
+
+info()    { echo "${BLUE}[INFO]${RESET}  $*"; }
+ok()      { echo "${GREEN}[OK]${RESET}    $*"; }
+warn()    { echo "${YELLOW}[WARN]${RESET}  $*"; }
+error()   { echo "${RED}[ERROR]${RESET} $*" >&2; }
+section() { echo ""; echo "${CYAN}${BOLD}▶ $*${RESET}"; }
+die()     { error "$*"; exit 1; }
+
+###############################################################################
+# Argument parsing
+###############################################################################
+
+MODE=""          # "system" | "user" | "" (auto-detect)
+ASSUME_YES=false
+
+show_help() {
+    cat <<EOF
+${BOLD}add-to-environment${RESET} — Add scan-repo to your shell PATH
+
+${BOLD}Usage:${RESET}
+  ./add-to-environment [OPTIONS]
+
+${BOLD}Options:${RESET}
+  --system    Install to /usr/local/bin (system-wide, requires sudo/root)
+  --user      Install to ~/.local/bin   (current user only, no sudo needed)
+  -y, --yes   Skip confirmation prompt
+  -h, --help  Show this help
+
+${BOLD}What this does:${RESET}
+  1. Copies the scan-repo script to a bin directory
+  2. Marks it executable
+  3. Adds that directory to PATH in your shell config (if not already present)
+  4. Verifies the command is reachable
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --system)  MODE="system"; shift ;;
+            --user)    MODE="user";   shift ;;
+            -y|--yes)  ASSUME_YES=true; shift ;;
+            -h|--help) show_help; exit 0 ;;
+            *) die "Unknown option: $1  (use --help for usage)" ;;
+        esac
+    done
+}
+
+###############################################################################
+# Locate the scan-repo source file
+###############################################################################
+
+find_scan_repo_source() {
+    # Look next to this script first (typical repo layout)
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local candidate="${script_dir}/scan-repo"
+
+    if [ -f "$candidate" ]; then
+        echo "$candidate"
+        return
+    fi
+
+    # Already on PATH?
+    local on_path
+    on_path="$(command -v scan-repo 2>/dev/null || true)"
+    if [ -n "$on_path" ]; then
+        echo "$on_path"
+        return
+    fi
+
+    die "Cannot find the scan-repo script.
+Expected it at: ${candidate}
+Make sure add-to-environment is in the same directory as scan-repo."
+}
+
+###############################################################################
+# Determine install mode (system vs user)
+###############################################################################
+
+choose_mode() {
+    if [ -n "$MODE" ]; then
+        return  # user explicitly chose
+    fi
+
+    if [ "$(id -u)" -eq 0 ]; then
+        MODE="system"
+        info "Running as root — using system install (/usr/local/bin)"
+    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        MODE="system"
+        info "sudo available — using system install (/usr/local/bin)"
+    else
+        MODE="user"
+        info "No root/sudo access — using user install (~/.local/bin)"
+    fi
+}
+
+###############################################################################
+# Shell rc file detection
+###############################################################################
+
+# Detect all rc files that are sourced for interactive shells for the current user.
+# Returns a newline-separated list.
+detect_rc_files() {
+    local files=()
+
+    # Respect $SHELL if set
+    case "${SHELL:-}" in
+        */zsh)
+            [ -f "${ZDOTDIR:-$HOME}/.zshrc" ]  && files+=("${ZDOTDIR:-$HOME}/.zshrc")
+            [ -f "${ZDOTDIR:-$HOME}/.zprofile" ] && files+=("${ZDOTDIR:-$HOME}/.zprofile")
+            ;;
+        */fish)
+            local fish_cfg="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"
+            [ -f "$fish_cfg" ] && files+=("$fish_cfg")
+            ;;
+    esac
+
+    # Always include bash files — user may switch shells
+    [ -f "$HOME/.bashrc"        ] && files+=("$HOME/.bashrc")
+    [ -f "$HOME/.bash_profile"  ] && files+=("$HOME/.bash_profile")
+    [ -f "$HOME/.profile"       ] && files+=("$HOME/.profile")
+
+    # Deduplicate
+    local seen=()
+    for f in "${files[@]}"; do
+        local dup=false
+        for s in "${seen[@]:-}"; do [ "$f" = "$s" ] && dup=true && break; done
+        $dup || seen+=("$f")
+    done
+
+    printf '%s\n' "${seen[@]:-}"
+}
+
+###############################################################################
+# Add a directory to PATH in rc files (idempotent)
+###############################################################################
+
+add_dir_to_rc_files() {
+    local dir="$1"
+    local updated_any=false
+
+    while IFS= read -r rc_file; do
+        [ -z "$rc_file" ] && continue
+        [ -f "$rc_file" ] || continue
+
+        # Skip if already present
+        if grep -q "${dir}" "$rc_file" 2>/dev/null; then
+            info "Already in PATH in ${rc_file}"
+            continue
+        fi
+
+        # Fish uses a different syntax
+        if [[ "$rc_file" == *"config.fish" ]]; then
+            printf '\n# Added by scan-repo add-to-environment\nfish_add_path "%s"\n' "$dir" >> "$rc_file"
+        else
+            printf '\n# Added by scan-repo add-to-environment\nexport PATH="%s:$PATH"\n' "$dir" >> "$rc_file"
+        fi
+
+        ok "Updated ${rc_file}"
+        updated_any=true
+    done < <(detect_rc_files)
+
+    if $updated_any; then
+        warn "Open a new terminal (or run: source ~/.bashrc) for the change to take effect."
+    fi
+}
+
+###############################################################################
+# System install  (/usr/local/bin)
+###############################################################################
+
+install_system() {
+    local src="$1"
+    local dest="/usr/local/bin/scan-repo"
+
+    local sudo_cmd=""
+    if [ "$(id -u)" -ne 0 ]; then
+        command -v sudo >/dev/null 2>&1 || die "sudo is required for a system install. Use --user instead."
+        sudo_cmd="sudo"
+        info "sudo will be used to write to /usr/local/bin"
+    fi
+
+    $sudo_cmd install -m 755 "$src" "$dest"
+    ok "Copied to ${dest}"
+
+    # /usr/local/bin is already on PATH everywhere; no rc changes needed.
+    if [[ ":$PATH:" != *":/usr/local/bin:"* ]]; then
+        warn "/usr/local/bin is not on your current PATH."
+        add_dir_to_rc_files "/usr/local/bin"
+    fi
+}
+
+###############################################################################
+# User install  (~/.local/bin)
+###############################################################################
+
+install_user() {
+    local src="$1"
+    local dest_dir="${HOME}/.local/bin"
+    local dest="${dest_dir}/scan-repo"
+
+    mkdir -p "$dest_dir"
+    install -m 755 "$src" "$dest"
+    ok "Copied to ${dest}"
+
+    add_dir_to_rc_files "$dest_dir"
+
+    # Also export for the current session so verify_install works immediately
+    export PATH="${dest_dir}:${PATH}"
+}
+
+###############################################################################
+# Verification
+###############################################################################
+
+verify_install() {
+    section "Verification"
+
+    local found
+    found="$(command -v scan-repo 2>/dev/null || true)"
+
+    if [ -n "$found" ]; then
+        ok "scan-repo is on PATH: ${found}"
+        ok "Version: $(scan-repo --version 2>&1 | head -n1)"
+        return 0
+    else
+        warn "scan-repo is not yet reachable in this shell session."
+        warn "Open a new terminal or run:"
+        case "${SHELL:-}" in
+            */zsh)  warn "  source ~/.zshrc" ;;
+            */fish) warn "  source ~/.config/fish/config.fish" ;;
+            *)      warn "  source ~/.bashrc" ;;
+        esac
+        warn "Then run: scan-repo --version"
+        return 1
+    fi
+}
+
+###############################################################################
+# Main
+###############################################################################
+
+main() {
+    parse_args "$@"
+
+    echo ""
+    echo "${CYAN}${BOLD}╔════════════════════════════════════════════════════════════╗${RESET}"
+    echo "${CYAN}${BOLD}║           scan-repo  ·  Add to Environment                ║${RESET}"
+    echo "${CYAN}${BOLD}╚════════════════════════════════════════════════════════════╝${RESET}"
+    echo ""
+
+    # ── Already available? ────────────────────────────────────────────────────
+    section "Checking current environment"
+
+    local src
+    src="$(find_scan_repo_source)"
+    info "scan-repo source: ${src}"
+
+    local existing
+    existing="$(command -v scan-repo 2>/dev/null || true)"
+    if [ -n "$existing" ]; then
+        ok "scan-repo is already on PATH at: ${existing}"
+        ok "Version: $(scan-repo --version 2>&1 | head -n1)"
+        echo ""
+        info "Nothing to do. Run scan-repo from any directory."
+        exit 0
+    fi
+
+    # ── Choose install mode ───────────────────────────────────────────────────
+    choose_mode
+
+    local dest_dir
+    case "$MODE" in
+        system) dest_dir="/usr/local/bin" ;;
+        user)   dest_dir="${HOME}/.local/bin" ;;
+    esac
+
+    echo ""
+    echo "  Source : ${BOLD}${src}${RESET}"
+    echo "  Install: ${BOLD}${dest_dir}/scan-repo${RESET}"
+    echo ""
+
+    if [ "$ASSUME_YES" = false ]; then
+        read -r -p "Continue? [y/N] " reply
+        echo ""
+        [[ "$reply" =~ ^[Yy]$ ]] || { info "Cancelled."; exit 0; }
+    fi
+
+    # ── Install ───────────────────────────────────────────────────────────────
+    section "Installing"
+
+    case "$MODE" in
+        system) install_system "$src" ;;
+        user)   install_user   "$src" ;;
+    esac
+
+    # ── Done ──────────────────────────────────────────────────────────────────
+    verify_install || true
+
+    echo ""
+    echo "${GREEN}${BOLD}Done!${RESET} You can now run scan-repo from any directory:"
+    echo ""
+    echo "  scan-repo --markdown /path/to/repo"
+    echo "  scan-repo --help"
+    echo ""
+}
+
+main "$@"

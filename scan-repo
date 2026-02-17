@@ -1,0 +1,914 @@
+#!/bin/bash
+
+###############################################################################
+# scan-repo - Comprehensive Security Scanner
+# 
+# Usage: scan-repo [options] [directory]
+#
+# A powerful security scanning tool that runs multiple security scanners
+# and generates comprehensive reports in multiple formats.
+###############################################################################
+
+VERSION="1.0.0"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# Configuration
+DEFAULT_OUTPUT_DIR="./security-reports"
+DEFAULT_FORMAT="json"
+VERBOSE=false
+QUIET=false
+CI_MODE=false
+FAIL_ON_HIGH=false
+FAIL_ON_CRITICAL=false
+SKIP_SEMGREP=false
+SKIP_TRIVY=false
+SKIP_OSV=false
+SKIP_GRYPE=false
+SKIP_NPM=false
+SKIP_LICENSE=false
+GENERATE_HTML=false
+GENERATE_MARKDOWN=false
+
+# Counters for findings
+CRITICAL_COUNT=0
+HIGH_COUNT=0
+MEDIUM_COUNT=0
+LOW_COUNT=0
+
+# Print functions
+print_banner() {
+    echo -e "${CYAN}"
+    cat << EOF
+╔════════════════════════════════════════════════════════════╗
+║                                                            ║
+║   ███████╗ ██████╗ █████╗ ███╗   ██╗    ██████╗ ███████╗ ║
+║   ██╔════╝██╔════╝██╔══██╗████╗  ██║    ██╔══██╗██╔════╝ ║
+║   ███████╗██║     ███████║██╔██╗ ██║    ██████╔╝█████╗   ║
+║   ╚════██║██║     ██╔══██║██║╚██╗██║    ██╔══██╗██╔══╝   ║
+║   ███████║╚██████╗██║  ██║██║ ╚████║    ██║  ██║███████╗ ║
+║   ╚══════╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝    ╚═╝  ╚═╝╚══════╝ ║
+║                                                            ║
+║            Repository Security Scanner v${VERSION}            ║
+╚════════════════════════════════════════════════════════════╝
+EOF
+    echo -e "${NC}"
+}
+
+print_info() { 
+    [ "$QUIET" = false ] && echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+print_success() { 
+    [ "$QUIET" = false ] && echo -e "${GREEN}[✓]${NC} $1"
+}
+
+print_warning() { 
+    echo -e "${YELLOW}[⚠]${NC} $1"
+}
+
+print_error() { 
+    echo -e "${RED}[✗]${NC} $1"
+}
+
+print_verbose() {
+    [ "$VERBOSE" = true ] && echo -e "${MAGENTA}[DEBUG]${NC} $1"
+}
+
+print_section() {
+    [ "$QUIET" = false ] && echo -e "\n${CYAN}${BOLD}▶ $1${NC}"
+}
+
+# Usage information
+show_usage() {
+    cat << EOF
+Usage: scan-repo [OPTIONS] [DIRECTORY]
+
+Comprehensive security scanner for repositories. Runs multiple security
+scanning tools and generates detailed reports.
+
+Arguments:
+  DIRECTORY              Directory to scan (default: current directory)
+
+Options:
+  -h, --help            Show this help message
+  -v, --version         Show version information
+  -o, --output DIR      Output directory for reports (default: ./security-reports)
+  -f, --format FORMAT   Report format: json, html, markdown, all (default: json)
+  
+Scan Options:
+  --skip-semgrep        Skip Semgrep SAST scan
+  --skip-trivy          Skip Trivy scan
+  --skip-osv            Skip OSV-Scanner
+  --skip-grype          Skip Grype scan
+  --skip-npm            Skip npm audit and related scans
+  --skip-license        Skip license checking
+  --only-sast           Run only SAST (Semgrep)
+  --only-deps           Run only dependency scans
+  --only-containers     Run only container scans
+
+CI/CD Options:
+  --ci                  CI mode: minimal output, exit codes
+  --fail-on-critical    Exit with code 1 if critical findings
+  --fail-on-high        Exit with code 1 if high severity findings
+  --no-progress         Disable progress indicators
+
+Output Options:
+  --verbose             Verbose output
+  --quiet               Minimal output (errors only)
+  --json                Generate JSON report (default)
+  --html                Generate HTML report
+  --markdown            Generate Markdown report
+  --all-formats         Generate all report formats
+
+Examples:
+  # Scan current directory
+  scan-repo
+
+  # Scan specific directory with HTML report
+  scan-repo -f html /path/to/repo
+
+  # CI mode with failure on critical issues
+  scan-repo --ci --fail-on-critical
+
+  # Run only SAST scan
+  scan-repo --only-sast
+
+  # Full scan with all report formats
+  scan-repo --all-formats -o ./reports
+
+  # Quiet mode for scripts
+  scan-repo --quiet --json -o /tmp/scan
+
+EOF
+}
+
+# Show version
+show_version() {
+    echo "scan-repo version $VERSION"
+    echo ""
+    echo "Available scanners:"
+    command -v semgrep >/dev/null 2>&1 && echo "  ✓ Semgrep $(semgrep --version 2>&1 | head -n1)" || echo "  ✗ Semgrep (not installed)"
+    command -v trivy >/dev/null 2>&1 && echo "  ✓ Trivy $(trivy --version 2>&1 | head -n1 | awk '{print $2}')" || echo "  ✗ Trivy (not installed)"
+    command -v osv-scanner >/dev/null 2>&1 && echo "  ✓ OSV-Scanner" || echo "  ✗ OSV-Scanner (not installed)"
+    command -v grype >/dev/null 2>&1 && echo "  ✓ Grype $(grype version 2>&1 | head -n1 | awk '{print $2}')" || echo "  ✗ Grype (not installed)"
+    command -v npm >/dev/null 2>&1 && echo "  ✓ npm $(npm --version)" || echo "  ✗ npm (not installed)"
+}
+
+# Check if command exists
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# Validate prerequisites
+check_prerequisites() {
+    local missing_tools=()
+    
+    if [ "$SKIP_SEMGREP" = false ] && ! command_exists semgrep; then
+        missing_tools+=("semgrep")
+    fi
+    
+    if [ "$SKIP_TRIVY" = false ] && ! command_exists trivy; then
+        missing_tools+=("trivy")
+    fi
+    
+    if [ "$SKIP_OSV" = false ] && ! command_exists osv-scanner; then
+        missing_tools+=("osv-scanner")
+    fi
+    
+    if [ "$SKIP_GRYPE" = false ] && ! command_exists grype; then
+        missing_tools+=("grype")
+    fi
+    
+    if [ ${#missing_tools[@]} -gt 0 ]; then
+        print_warning "Some scanning tools are not installed:"
+        for tool in "${missing_tools[@]}"; do
+            echo "  ✗ $tool"
+        done
+        echo ""
+        echo "Install missing tools or use --skip-<tool> to skip them."
+        echo "Installation: curl -sSL https://your-installer-url.sh | bash"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Create output directory
+setup_output_dir() {
+    if [ ! -d "$OUTPUT_DIR" ]; then
+        mkdir -p "$OUTPUT_DIR" || {
+            print_error "Failed to create output directory: $OUTPUT_DIR"
+            exit 1
+        }
+        print_verbose "Created output directory: $OUTPUT_DIR"
+    fi
+}
+
+# Run Semgrep scan
+run_semgrep() {
+    if [ "$SKIP_SEMGREP" = true ]; then
+        return 0
+    fi
+    
+    print_section "Semgrep SAST Scan"
+    
+    if ! command_exists semgrep; then
+        print_warning "Semgrep not installed, skipping"
+        return 0
+    fi
+    
+    local output_file="${OUTPUT_DIR}/semgrep-${TIMESTAMP}.json"
+    
+    print_info "Running Semgrep with multiple rulesets..."
+    
+    semgrep \
+        --config=p/security-audit \
+        --config=p/owasp-top-ten \
+        --config=p/cwe-top-25 \
+        --config=p/secrets \
+        --json \
+        --output="$output_file" \
+        --quiet \
+        "$TARGET_DIR" 2>/dev/null || true
+    
+    if [ -f "$output_file" ]; then
+        local findings=$(jq '.results | length' "$output_file" 2>/dev/null || echo "0")
+        print_success "Semgrep scan complete: $findings findings"
+        
+        # Count severity
+        local critical=$(jq '[.results[] | select(.extra.severity == "ERROR")] | length' "$output_file" 2>/dev/null || echo "0")
+        local high=$(jq '[.results[] | select(.extra.severity == "WARNING")] | length' "$output_file" 2>/dev/null || echo "0")
+        
+        CRITICAL_COUNT=$((CRITICAL_COUNT + critical))
+        HIGH_COUNT=$((HIGH_COUNT + high))
+        
+        print_verbose "  Critical: $critical, High: $high"
+    else
+        print_warning "Semgrep scan produced no output"
+    fi
+}
+
+# Run Trivy scan
+run_trivy() {
+    if [ "$SKIP_TRIVY" = true ]; then
+        return 0
+    fi
+    
+    print_section "Trivy Vulnerability Scan"
+    
+    if ! command_exists trivy; then
+        print_warning "Trivy not installed, skipping"
+        return 0
+    fi
+    
+    local output_file="${OUTPUT_DIR}/trivy-${TIMESTAMP}.json"
+    
+    print_info "Running Trivy filesystem scan..."
+    
+    trivy fs \
+        --format json \
+        --output "$output_file" \
+        --quiet \
+        "$TARGET_DIR" 2>/dev/null || true
+    
+    if [ -f "$output_file" ]; then
+        local findings=$(jq '[.Results[]?.Vulnerabilities[]?] | length' "$output_file" 2>/dev/null || echo "0")
+        print_success "Trivy scan complete: $findings vulnerabilities"
+        
+        # Count severity
+        local critical=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' "$output_file" 2>/dev/null || echo "0")
+        local high=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH")] | length' "$output_file" 2>/dev/null || echo "0")
+        local medium=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "MEDIUM")] | length' "$output_file" 2>/dev/null || echo "0")
+        local low=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "LOW")] | length' "$output_file" 2>/dev/null || echo "0")
+
+        CRITICAL_COUNT=$((CRITICAL_COUNT + critical))
+        HIGH_COUNT=$((HIGH_COUNT + high))
+        MEDIUM_COUNT=$((MEDIUM_COUNT + medium))
+        LOW_COUNT=$((LOW_COUNT + low))
+
+        print_verbose "  Critical: $critical, High: $high, Medium: $medium, Low: $low"
+    else
+        print_warning "Trivy scan produced no output"
+    fi
+
+    # Scan Dockerfile if present
+    if [ -f "$TARGET_DIR/Dockerfile" ]; then
+        print_info "Scanning Dockerfile..."
+        local dockerfile_output="${OUTPUT_DIR}/dockerfile-${TIMESTAMP}.json"
+
+        trivy config \
+            --format json \
+            --output "$dockerfile_output" \
+            --quiet \
+            "$TARGET_DIR/Dockerfile" 2>/dev/null || true
+
+        if [ -f "$dockerfile_output" ]; then
+            local misconfig_count
+            misconfig_count=$(jq '[.Results[]?.Misconfigurations[]?] | length' "$dockerfile_output" 2>/dev/null || echo "0")
+            local misconfig_critical=$(jq '[.Results[]?.Misconfigurations[]? | select(.Severity == "CRITICAL")] | length' "$dockerfile_output" 2>/dev/null || echo "0")
+            local misconfig_high=$(jq '[.Results[]?.Misconfigurations[]? | select(.Severity == "HIGH")] | length' "$dockerfile_output" 2>/dev/null || echo "0")
+            local misconfig_medium=$(jq '[.Results[]?.Misconfigurations[]? | select(.Severity == "MEDIUM")] | length' "$dockerfile_output" 2>/dev/null || echo "0")
+            local misconfig_low=$(jq '[.Results[]?.Misconfigurations[]? | select(.Severity == "LOW")] | length' "$dockerfile_output" 2>/dev/null || echo "0")
+
+            CRITICAL_COUNT=$((CRITICAL_COUNT + misconfig_critical))
+            HIGH_COUNT=$((HIGH_COUNT + misconfig_high))
+            MEDIUM_COUNT=$((MEDIUM_COUNT + misconfig_medium))
+            LOW_COUNT=$((LOW_COUNT + misconfig_low))
+
+            print_success "Dockerfile scan complete: $misconfig_count misconfigurations"
+        fi
+    fi
+}
+
+# Run OSV-Scanner
+run_osv_scanner() {
+    if [ "$SKIP_OSV" = true ]; then
+        return 0
+    fi
+    
+    print_section "OSV Vulnerability Database Scan"
+    
+    if ! command_exists osv-scanner; then
+        print_warning "OSV-Scanner not installed, skipping"
+        return 0
+    fi
+    
+    local output_file="${OUTPUT_DIR}/osv-${TIMESTAMP}.json"
+    
+    print_info "Running OSV-Scanner..."
+    
+    osv-scanner scan \
+        --format json \
+        --output "$output_file" \
+        --recursive \
+        "$TARGET_DIR" 2>/dev/null || true
+    
+    if [ -f "$output_file" ]; then
+        local findings=$(jq '.results[].packages[].vulnerabilities | length' "$output_file" 2>/dev/null | awk '{s+=$1} END {print s+0}')
+        print_success "OSV scan complete: $findings vulnerabilities"
+    else
+        print_warning "OSV scan produced no output"
+    fi
+}
+
+# Run Grype scan
+run_grype() {
+    if [ "$SKIP_GRYPE" = true ]; then
+        return 0
+    fi
+    
+    print_section "Grype Vulnerability Scan"
+    
+    if ! command_exists grype; then
+        print_warning "Grype not installed, skipping"
+        return 0
+    fi
+    
+    local output_file="${OUTPUT_DIR}/grype-${TIMESTAMP}.json"
+    
+    print_info "Running Grype scan..."
+    
+    grype dir:"$TARGET_DIR" -o json > "$output_file" 2>/dev/null || true
+    
+    if [ -f "$output_file" ]; then
+        local findings=$(jq '.matches | length' "$output_file" 2>/dev/null || echo "0")
+        print_success "Grype scan complete: $findings matches"
+        
+        # Count severity
+        local critical=$(jq '[.matches[] | select(.vulnerability.severity == "Critical")] | length' "$output_file" 2>/dev/null || echo "0")
+        local high=$(jq '[.matches[] | select(.vulnerability.severity == "High")] | length' "$output_file" 2>/dev/null || echo "0")
+        local medium=$(jq '[.matches[] | select(.vulnerability.severity == "Medium")] | length' "$output_file" 2>/dev/null || echo "0")
+        local low=$(jq '[.matches[] | select(.vulnerability.severity == "Low")] | length' "$output_file" 2>/dev/null || echo "0")
+
+        CRITICAL_COUNT=$((CRITICAL_COUNT + critical))
+        HIGH_COUNT=$((HIGH_COUNT + high))
+        MEDIUM_COUNT=$((MEDIUM_COUNT + medium))
+        LOW_COUNT=$((LOW_COUNT + low))
+
+        print_verbose "  Critical: $critical, High: $high, Medium: $medium, Low: $low"
+    else
+        print_warning "Grype scan produced no output"
+    fi
+}
+
+# Run npm audit
+run_npm_audit() {
+    if [ "$SKIP_NPM" = true ]; then
+        return 0
+    fi
+    
+    if [ ! -f "$TARGET_DIR/package.json" ]; then
+        print_verbose "No package.json found, skipping npm scans"
+        return 0
+    fi
+    
+    print_section "npm Security Audit"
+    
+    if ! command_exists npm; then
+        print_warning "npm not installed, skipping"
+        return 0
+    fi
+    
+    local output_file="${OUTPUT_DIR}/npm-audit-${TIMESTAMP}.json"
+    
+    print_info "Running npm audit..."
+    
+    (cd "$TARGET_DIR" && npm audit --json > "$output_file" 2>&1) || true
+    
+    if [ -f "$output_file" ]; then
+        local critical=$(jq '.metadata.vulnerabilities.critical // 0' "$output_file" 2>/dev/null || echo "0")
+        local high=$(jq '.metadata.vulnerabilities.high // 0' "$output_file" 2>/dev/null || echo "0")
+        local medium=$(jq '.metadata.vulnerabilities.moderate // 0' "$output_file" 2>/dev/null || echo "0")
+        local low=$(jq '.metadata.vulnerabilities.low // 0' "$output_file" 2>/dev/null || echo "0")
+        local total=$(jq '.metadata.vulnerabilities.total // 0' "$output_file" 2>/dev/null || echo "0")
+
+        print_success "npm audit complete: $total vulnerabilities"
+
+        CRITICAL_COUNT=$((CRITICAL_COUNT + critical))
+        HIGH_COUNT=$((HIGH_COUNT + high))
+        MEDIUM_COUNT=$((MEDIUM_COUNT + medium))
+        LOW_COUNT=$((LOW_COUNT + low))
+
+        print_verbose "  Critical: $critical, High: $high, Medium: $medium, Low: $low"
+    fi
+    
+    # Run retire.js if available
+    if command_exists retire && [ "$SKIP_NPM" = false ]; then
+        print_info "Running retire.js scan..."
+        local retire_output="${OUTPUT_DIR}/retire-${TIMESTAMP}.json"
+        
+        (cd "$TARGET_DIR" && retire --outputformat json --outputpath "$retire_output" 2>/dev/null) || true
+        
+        if [ -f "$retire_output" ]; then
+            print_success "retire.js scan complete"
+        fi
+    fi
+}
+
+# Run license checker
+run_license_check() {
+    if [ "$SKIP_LICENSE" = true ]; then
+        return 0
+    fi
+    
+    if [ ! -f "$TARGET_DIR/package.json" ]; then
+        return 0
+    fi
+    
+    print_section "License Compliance Check"
+    
+    if ! command_exists license-checker; then
+        print_warning "license-checker not installed, skipping"
+        return 0
+    fi
+    
+    local output_file="${OUTPUT_DIR}/licenses-${TIMESTAMP}.json"
+    
+    print_info "Checking licenses..."
+    
+    (cd "$TARGET_DIR" && license-checker --json --out "$output_file" 2>/dev/null) || true
+    
+    if [ -f "$output_file" ]; then
+        local count=$(jq 'keys | length' "$output_file" 2>/dev/null || echo "0")
+        print_success "License check complete: $count packages"
+    fi
+}
+
+# Generate summary report
+generate_summary() {
+    print_section "Scan Summary"
+    
+    echo ""
+    echo "╔════════════════════════════════════════════════════════════╗"
+    echo "║                    FINDINGS SUMMARY                        ║"
+    echo "╠════════════════════════════════════════════════════════════╣"
+    printf "║  ${RED}Critical:${NC} %-3d                                           ║\n" "$CRITICAL_COUNT"
+    printf "║  ${YELLOW}High:${NC}     %-3d                                           ║\n" "$HIGH_COUNT"
+    printf "║  ${BLUE}Medium:${NC}   %-3d                                           ║\n" "$MEDIUM_COUNT"
+    printf "║  ${GREEN}Low:${NC}      %-3d                                           ║\n" "$LOW_COUNT"
+    echo "╚════════════════════════════════════════════════════════════╝"
+    echo ""
+    
+    print_info "Reports saved in: $OUTPUT_DIR"
+    echo ""
+    
+    # List generated reports
+    if [ "$QUIET" = false ]; then
+        echo "Generated reports:"
+        ls -lh "${OUTPUT_DIR}/"*"${TIMESTAMP}"* 2>/dev/null | awk '{printf "  • %s (%s)\n", $9, $5}'
+    fi
+}
+
+# Generate HTML report
+generate_html_report() {
+    if [ "$GENERATE_HTML" = false ]; then
+        return 0
+    fi
+    
+    print_info "Generating HTML report..."
+    
+    local html_file="${OUTPUT_DIR}/report-${TIMESTAMP}.html"
+    
+    cat > "$html_file" << EOF
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Security Scan Report</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        h1 { color: #333; border-bottom: 3px solid #4CAF50; padding-bottom: 10px; }
+        .summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin: 20px 0; }
+        .stat-card { padding: 20px; border-radius: 8px; text-align: center; }
+        .critical { background: #ffebee; color: #c62828; }
+        .high { background: #fff3e0; color: #ef6c00; }
+        .medium { background: #fff9c4; color: #f57f17; }
+        .low { background: #e8f5e9; color: #2e7d32; }
+        .stat-number { font-size: 36px; font-weight: bold; }
+        .stat-label { font-size: 14px; text-transform: uppercase; margin-top: 5px; }
+        .reports { margin-top: 30px; }
+        .report-item { background: #f5f5f5; padding: 15px; margin: 10px 0; border-radius: 4px; }
+        .timestamp { color: #666; font-size: 14px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔒 Security Scan Report</h1>
+        <div class="timestamp">Generated: $(date)</div>
+        <div class="timestamp">Target: $TARGET_DIR</div>
+        
+        <div class="summary">
+            <div class="stat-card critical">
+                <div class="stat-number">$CRITICAL_COUNT</div>
+                <div class="stat-label">Critical</div>
+            </div>
+            <div class="stat-card high">
+                <div class="stat-number">$HIGH_COUNT</div>
+                <div class="stat-label">High</div>
+            </div>
+            <div class="stat-card medium">
+                <div class="stat-number">$MEDIUM_COUNT</div>
+                <div class="stat-label">Medium</div>
+            </div>
+            <div class="stat-card low">
+                <div class="stat-number">$LOW_COUNT</div>
+                <div class="stat-label">Low</div>
+            </div>
+        </div>
+        
+        <div class="reports">
+            <h2>📊 Detailed Reports</h2>
+            <p>JSON reports have been generated for detailed analysis:</p>
+            <ul>
+EOF
+
+    # List all JSON reports
+    for report in "${OUTPUT_DIR}/"*"${TIMESTAMP}"*.json; do
+        if [ -f "$report" ]; then
+            local basename=$(basename "$report")
+            echo "                <li><code>$basename</code></li>" >> "$html_file"
+        fi
+    done
+    
+    cat >> "$html_file" << EOF
+            </ul>
+        </div>
+        
+        <div style="margin-top: 40px; padding-top: 20px; border-top: 1px solid #ddd; color: #666; font-size: 12px;">
+            Generated by scan-repo v$VERSION
+        </div>
+    </div>
+</body>
+</html>
+EOF
+    
+    print_success "HTML report generated: $html_file"
+}
+
+# Generate Markdown report
+generate_markdown_report() {
+    if [ "$GENERATE_MARKDOWN" = false ]; then
+        return 0
+    fi
+
+    print_info "Generating Markdown report..."
+
+    local md_file="${OUTPUT_DIR}/REPORT-${TIMESTAMP}.md"
+
+    cat > "$md_file" << EOF
+# Security Scan Report
+
+**Generated:** $(date)
+**Target:** \`$TARGET_DIR\`
+**Scanner Version:** $VERSION
+
+---
+
+## Summary
+
+| Severity | Count |
+|----------|-------|
+| Critical | $CRITICAL_COUNT |
+| High | $HIGH_COUNT |
+| Medium | $MEDIUM_COUNT |
+| Low | $LOW_COUNT |
+
+**Total Issues:** $((CRITICAL_COUNT + HIGH_COUNT + MEDIUM_COUNT + LOW_COUNT))
+
+---
+
+EOF
+
+    # --- Semgrep findings ---
+    local semgrep_file="${OUTPUT_DIR}/semgrep-${TIMESTAMP}.json"
+    if [ -f "$semgrep_file" ] && [ -s "$semgrep_file" ]; then
+        local semgrep_count
+        semgrep_count=$(jq '.results | length' "$semgrep_file" 2>/dev/null || echo "0")
+        echo "## Semgrep SAST ($semgrep_count findings)" >> "$md_file"
+        echo "" >> "$md_file"
+        if [ "$semgrep_count" -gt 0 ]; then
+            echo "| Severity | Rule | File | Line | Message |" >> "$md_file"
+            echo "|----------|------|------|------|---------|" >> "$md_file"
+            jq -r '.results[] | "| \(.extra.severity // "INFO") | `\(.check_id)` | `\(.path)` | \(.start.line) | \(.extra.message | gsub("\n"; " ") | .[0:120]) |"' \
+                "$semgrep_file" 2>/dev/null >> "$md_file"
+        else
+            echo "No findings." >> "$md_file"
+        fi
+        echo "" >> "$md_file"
+        echo "---" >> "$md_file"
+        echo "" >> "$md_file"
+    fi
+
+    # --- Trivy findings ---
+    local trivy_file="${OUTPUT_DIR}/trivy-${TIMESTAMP}.json"
+    if [ -f "$trivy_file" ] && [ -s "$trivy_file" ]; then
+        local trivy_count
+        trivy_count=$(jq '[.Results[]?.Vulnerabilities[]?] | length' "$trivy_file" 2>/dev/null || echo "0")
+        echo "## Trivy Vulnerability Scan ($trivy_count findings)" >> "$md_file"
+        echo "" >> "$md_file"
+        if [ "$trivy_count" -gt 0 ]; then
+            echo "| Severity | CVE | Package | Installed | Fixed In | Title |" >> "$md_file"
+            echo "|----------|-----|---------|-----------|----------|-------|" >> "$md_file"
+            jq -r '.Results[]? | .Vulnerabilities[]? | "| \(.Severity) | \(.VulnerabilityID) | `\(.PkgName)` | \(.InstalledVersion) | \(.FixedVersion // "N/A") | \(.Title // .Description[0:80] // "N/A") |"' \
+                "$trivy_file" 2>/dev/null >> "$md_file"
+        else
+            echo "No findings." >> "$md_file"
+        fi
+        echo "" >> "$md_file"
+        echo "---" >> "$md_file"
+        echo "" >> "$md_file"
+    fi
+
+    # --- Grype findings ---
+    local grype_file="${OUTPUT_DIR}/grype-${TIMESTAMP}.json"
+    if [ -f "$grype_file" ] && [ -s "$grype_file" ]; then
+        local grype_count
+        grype_count=$(jq '.matches | length' "$grype_file" 2>/dev/null || echo "0")
+        echo "## Grype Vulnerability Scan ($grype_count findings)" >> "$md_file"
+        echo "" >> "$md_file"
+        if [ "$grype_count" -gt 0 ]; then
+            echo "| Severity | CVE | Package | Version | Fix Available |" >> "$md_file"
+            echo "|----------|-----|---------|---------|---------------|" >> "$md_file"
+            jq -r '.matches[] | "| \(.vulnerability.severity) | \(.vulnerability.id) | `\(.artifact.name)` | \(.artifact.version) | \(.vulnerability.fix.versions[0] // "N/A") |"' \
+                "$grype_file" 2>/dev/null >> "$md_file"
+        else
+            echo "No findings." >> "$md_file"
+        fi
+        echo "" >> "$md_file"
+        echo "---" >> "$md_file"
+        echo "" >> "$md_file"
+    fi
+
+    # --- OSV findings ---
+    local osv_file="${OUTPUT_DIR}/osv-${TIMESTAMP}.json"
+    if [ -f "$osv_file" ] && [ -s "$osv_file" ]; then
+        local osv_count
+        osv_count=$(jq '.results[].packages[].vulnerabilities | length' "$osv_file" 2>/dev/null | awk '{s+=$1} END {print s+0}')
+        echo "## OSV Vulnerability Database ($osv_count findings)" >> "$md_file"
+        echo "" >> "$md_file"
+        if [ "$osv_count" -gt 0 ]; then
+            echo "| Vulnerability ID | Package | Version | Summary |" >> "$md_file"
+            echo "|-----------------|---------|---------|---------|" >> "$md_file"
+            jq -r '.results[].packages[] | .package as $pkg | .vulnerabilities[]? | "| \(.id) | `\($pkg.name)` | \($pkg.version) | \(.summary // .details[0:100] // "N/A") |"' \
+                "$osv_file" 2>/dev/null >> "$md_file"
+        else
+            echo "No findings." >> "$md_file"
+        fi
+        echo "" >> "$md_file"
+        echo "---" >> "$md_file"
+        echo "" >> "$md_file"
+    fi
+
+    # --- Dockerfile / IaC findings ---
+    local dockerfile_file="${OUTPUT_DIR}/dockerfile-${TIMESTAMP}.json"
+    if [ -f "$dockerfile_file" ] && [ -s "$dockerfile_file" ]; then
+        local misconfig_count
+        misconfig_count=$(jq '[.Results[]?.Misconfigurations[]?] | length' "$dockerfile_file" 2>/dev/null || echo "0")
+        echo "## Dockerfile / IaC Misconfigurations ($misconfig_count findings)" >> "$md_file"
+        echo "" >> "$md_file"
+        if [ "$misconfig_count" -gt 0 ]; then
+            echo "| Severity | ID | Title | Line | Message |" >> "$md_file"
+            echo "|----------|----|-------|------|---------|" >> "$md_file"
+            jq -r '.Results[]?.Misconfigurations[]? | "| \(.Severity) | \(.ID) | \(.Title) | \(.CauseMetadata.StartLine // "N/A") | \(.Message) |"' \
+                "$dockerfile_file" 2>/dev/null >> "$md_file"
+        else
+            echo "No misconfigurations found." >> "$md_file"
+        fi
+        echo "" >> "$md_file"
+        echo "---" >> "$md_file"
+        echo "" >> "$md_file"
+    fi
+
+    # --- npm audit findings ---
+    local npm_file="${OUTPUT_DIR}/npm-audit-${TIMESTAMP}.json"
+    if [ -f "$npm_file" ] && [ -s "$npm_file" ]; then
+        local npm_pkg_count npm_advisory_count
+        npm_pkg_count=$(jq '.metadata.vulnerabilities.total // 0' "$npm_file" 2>/dev/null || echo "0")
+        npm_advisory_count=$(jq '[.vulnerabilities | to_entries[] | .value.via[] | select(type == "object")] | length' "$npm_file" 2>/dev/null || echo "0")
+        echo "## npm Audit ($npm_advisory_count advisories in $npm_pkg_count vulnerable packages)" >> "$md_file"
+        echo "" >> "$md_file"
+        if [ "$npm_pkg_count" -gt 0 ]; then
+            echo "| Severity | Package | Advisory | URL |" >> "$md_file"
+            echo "|----------|---------|----------|-----|" >> "$md_file"
+            jq -r '.vulnerabilities | to_entries[] | .value as $v | .value.via[] | select(type == "object") | "| \($v.severity | ascii_upcase | gsub("MODERATE"; "MEDIUM")) | `\($v.name)` | \(.title) | \(.url) |"' \
+                "$npm_file" 2>/dev/null >> "$md_file"
+        else
+            echo "No vulnerabilities found." >> "$md_file"
+        fi
+        echo "" >> "$md_file"
+        echo "---" >> "$md_file"
+        echo "" >> "$md_file"
+    fi
+
+    cat >> "$md_file" << EOF
+## Next Steps
+
+### Critical & High Priority
+1. Review and fix critical vulnerabilities immediately
+2. Update dependencies with known high-severity CVEs
+3. Remove any hardcoded secrets or credentials
+
+### Medium Priority
+- Review medium severity findings
+- Update dependencies where feasible
+- Implement security best practices
+
+### Low Priority
+- Address code quality issues
+- Review informational findings
+- Consider security enhancements
+
+---
+
+*Report generated by scan-repo v$VERSION*
+EOF
+
+    print_success "Markdown report generated: $md_file"
+}
+
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                show_usage
+                exit 0
+                ;;
+            -v|--version)
+                show_version
+                exit 0
+                ;;
+            -o|--output)
+                OUTPUT_DIR="$2"
+                shift 2
+                ;;
+            -f|--format)
+                case $2 in
+                    json) DEFAULT_FORMAT="json" ;;
+                    html) GENERATE_HTML=true ;;
+                    markdown) GENERATE_MARKDOWN=true ;;
+                    all) GENERATE_HTML=true; GENERATE_MARKDOWN=true ;;
+                    *) print_error "Unknown format: $2"; exit 1 ;;
+                esac
+                shift 2
+                ;;
+            --skip-semgrep) SKIP_SEMGREP=true; shift ;;
+            --skip-trivy) SKIP_TRIVY=true; shift ;;
+            --skip-osv) SKIP_OSV=true; shift ;;
+            --skip-grype) SKIP_GRYPE=true; shift ;;
+            --skip-npm) SKIP_NPM=true; shift ;;
+            --skip-license) SKIP_LICENSE=true; shift ;;
+            --only-sast)
+                SKIP_TRIVY=true; SKIP_OSV=true; SKIP_GRYPE=true
+                SKIP_NPM=true; SKIP_LICENSE=true
+                shift
+                ;;
+            --only-deps)
+                SKIP_SEMGREP=true
+                shift
+                ;;
+            --only-containers)
+                SKIP_SEMGREP=true; SKIP_OSV=true; SKIP_GRYPE=true
+                SKIP_NPM=true; SKIP_LICENSE=true
+                shift
+                ;;
+            --ci) CI_MODE=true; QUIET=true; shift ;;
+            --fail-on-critical) FAIL_ON_CRITICAL=true; shift ;;
+            --fail-on-high) FAIL_ON_HIGH=true; shift ;;
+            --verbose) VERBOSE=true; shift ;;
+            --quiet) QUIET=true; shift ;;
+            --json) DEFAULT_FORMAT="json"; shift ;;
+            --html) GENERATE_HTML=true; shift ;;
+            --markdown) GENERATE_MARKDOWN=true; shift ;;
+            --all-formats) GENERATE_HTML=true; GENERATE_MARKDOWN=true; shift ;;
+            --no-progress) shift ;;
+            -*)
+                print_error "Unknown option: $1"
+                echo "Use --help for usage information"
+                exit 1
+                ;;
+            *)
+                TARGET_DIR="$1"
+                shift
+                ;;
+        esac
+    done
+}
+
+# Main execution
+main() {
+    # Set defaults
+    TARGET_DIR="${TARGET_DIR:-.}"
+    OUTPUT_DIR="${OUTPUT_DIR:-$DEFAULT_OUTPUT_DIR}"
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    
+    # Resolve to absolute path
+    TARGET_DIR=$(cd "$TARGET_DIR" 2>/dev/null && pwd || echo "$TARGET_DIR")
+    
+    # Show banner unless quiet
+    [ "$QUIET" = false ] && [ "$CI_MODE" = false ] && print_banner
+    
+    # Validate target directory
+    if [ ! -d "$TARGET_DIR" ]; then
+        print_error "Directory not found: $TARGET_DIR"
+        exit 1
+    fi
+    
+    print_info "Target directory: $TARGET_DIR"
+    print_info "Output directory: $OUTPUT_DIR"
+    print_info "Timestamp: $TIMESTAMP"
+    
+    # Check prerequisites
+    check_prerequisites || exit 1
+    
+    # Setup output directory
+    setup_output_dir
+    
+    # Run scans
+    print_section "Starting Security Scans"
+    
+    run_semgrep
+    run_trivy
+    run_osv_scanner
+    run_grype
+    run_npm_audit
+    run_license_check
+    
+    # Generate reports
+    generate_html_report
+    generate_markdown_report
+    
+    # Show summary
+    [ "$QUIET" = false ] && generate_summary
+    
+    # Determine exit code
+    local exit_code=0
+    
+    if [ "$FAIL_ON_CRITICAL" = true ] && [ "$CRITICAL_COUNT" -gt 0 ]; then
+        print_error "Critical vulnerabilities found: $CRITICAL_COUNT"
+        exit_code=1
+    elif [ "$FAIL_ON_HIGH" = true ] && [ "$HIGH_COUNT" -gt 0 ]; then
+        print_error "High severity vulnerabilities found: $HIGH_COUNT"
+        exit_code=1
+    fi
+    
+    if [ $exit_code -eq 0 ]; then
+        [ "$QUIET" = false ] && print_success "Scan completed successfully!"
+    fi
+    
+    exit $exit_code
+}
+
+# Parse arguments and run
+parse_args "$@"
+main
