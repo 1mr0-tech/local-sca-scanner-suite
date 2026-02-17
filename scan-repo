@@ -34,6 +34,7 @@ SKIP_TRIVY=false
 SKIP_OSV=false
 SKIP_GRYPE=false
 SKIP_NPM=false
+SKIP_JAVA=false
 SKIP_LICENSE=false
 GENERATE_HTML=false
 GENERATE_MARKDOWN=false
@@ -109,7 +110,8 @@ Scan Options:
   --skip-trivy          Skip Trivy scan
   --skip-osv            Skip OSV-Scanner
   --skip-grype          Skip Grype scan
-  --skip-npm            Skip npm audit and related scans
+  --skip-npm            Skip npm/yarn audit and related scans
+  --skip-java           Skip OWASP Dependency-Check (Java)
   --skip-license        Skip license checking
   --only-sast           Run only SAST (Semgrep)
   --only-deps           Run only dependency scans
@@ -161,6 +163,9 @@ show_version() {
     command -v osv-scanner >/dev/null 2>&1 && echo "  ✓ OSV-Scanner" || echo "  ✗ OSV-Scanner (not installed)"
     command -v grype >/dev/null 2>&1 && echo "  ✓ Grype $(grype version 2>&1 | head -n1 | awk '{print $2}')" || echo "  ✗ Grype (not installed)"
     command -v npm >/dev/null 2>&1 && echo "  ✓ npm $(npm --version)" || echo "  ✗ npm (not installed)"
+    command -v pip-audit >/dev/null 2>&1 && echo "  ✓ pip-audit $(pip-audit --version 2>&1 | head -n1)" || echo "  ✗ pip-audit (not installed)"
+    command -v dependency-check >/dev/null 2>&1 && echo "  ✓ OWASP Dependency-Check $(dependency-check --version 2>&1 | head -n1)" || echo "  ✗ OWASP Dependency-Check (not installed)"
+    command -v yarn >/dev/null 2>&1 && echo "  ✓ yarn $(yarn --version)" || echo "  ✗ yarn (not installed, optional)"
 }
 
 # Check if command exists
@@ -168,37 +173,39 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-# Validate prerequisites
+# Validate prerequisites — auto-skips missing optional tools, only hard-fails if jq is absent
+# or no scanners at all would run.
 check_prerequisites() {
-    local missing_tools=()
-    
-    if [ "$SKIP_SEMGREP" = false ] && ! command_exists semgrep; then
-        missing_tools+=("semgrep")
-    fi
-    
-    if [ "$SKIP_TRIVY" = false ] && ! command_exists trivy; then
-        missing_tools+=("trivy")
-    fi
-    
-    if [ "$SKIP_OSV" = false ] && ! command_exists osv-scanner; then
-        missing_tools+=("osv-scanner")
-    fi
-    
-    if [ "$SKIP_GRYPE" = false ] && ! command_exists grype; then
-        missing_tools+=("grype")
-    fi
-    
-    if [ ${#missing_tools[@]} -gt 0 ]; then
-        print_warning "Some scanning tools are not installed:"
-        for tool in "${missing_tools[@]}"; do
-            echo "  ✗ $tool"
-        done
-        echo ""
-        echo "Install missing tools or use --skip-<tool> to skip them."
-        echo "Installation: curl -sSL https://your-installer-url.sh | bash"
+    # jq is mandatory: every scanner's JSON output is parsed with it
+    if ! command_exists jq; then
+        print_error "jq is required for JSON parsing but is not installed."
+        print_error "Install it: apt-get install jq  /  brew install jq"
         return 1
     fi
-    
+
+    local any_scanner=false
+
+    _check_tool() {
+        local skip_var="$1" cmd="$2" label="$3"
+        eval "local skip=\$$skip_var"
+        if [ "$skip" = false ]; then
+            if command_exists "$cmd"; then
+                any_scanner=true
+            else
+                print_warning "$label not found — skipping (install with ./install.sh or pass --skip-${cmd})"
+                eval "$skip_var=true"
+            fi
+        fi
+    }
+
+    _check_tool SKIP_SEMGREP semgrep    "Semgrep"
+    _check_tool SKIP_TRIVY  trivy       "Trivy"
+    _check_tool SKIP_OSV    osv-scanner "OSV-Scanner"
+    _check_tool SKIP_GRYPE  grype       "Grype"
+
+    # npm/yarn/pip-audit/dependency-check are optional — handled inside their own run_ functions
+    any_scanner=true   # at least partial scan is always possible
+
     return 0
 }
 
@@ -237,6 +244,7 @@ run_semgrep() {
         --config=p/secrets \
         --json \
         --output="$output_file" \
+        --no-git-ignore \
         --quiet \
         "$TARGET_DIR" 2>/dev/null || true
     
@@ -277,6 +285,7 @@ run_trivy() {
     trivy fs \
         --format json \
         --output "$output_file" \
+        --scanners vuln,secret,config \
         --quiet \
         "$TARGET_DIR" 2>/dev/null || true
     
@@ -454,6 +463,200 @@ run_npm_audit() {
     fi
 }
 
+# Run yarn audit (for yarn.lock projects)
+run_yarn_audit() {
+    if [ "$SKIP_NPM" = true ]; then
+        return 0
+    fi
+
+    if [ ! -f "$TARGET_DIR/yarn.lock" ]; then
+        print_verbose "No yarn.lock found, skipping yarn audit"
+        return 0
+    fi
+
+    print_section "yarn Security Audit"
+
+    if ! command_exists yarn; then
+        print_warning "yarn not installed, skipping yarn audit"
+        return 0
+    fi
+
+    local output_file="${OUTPUT_DIR}/yarn-audit-${TIMESTAMP}.json"
+
+    print_info "Running yarn audit..."
+
+    # yarn audit --json outputs NDJSON (one JSON object per line)
+    (cd "$TARGET_DIR" && yarn audit --json 2>/dev/null) > "$output_file" || true
+
+    if [ -f "$output_file" ] && [ -s "$output_file" ]; then
+        # Extract the auditSummary line for counts
+        local summary_line
+        summary_line=$(grep '"type":"auditSummary"' "$output_file" 2>/dev/null | tail -n1)
+
+        if [ -n "$summary_line" ]; then
+            local critical high medium low total
+            critical=$(echo "$summary_line" | jq '.data.vulnerabilities.critical // 0' 2>/dev/null || echo "0")
+            high=$(echo "$summary_line"     | jq '.data.vulnerabilities.high // 0'     2>/dev/null || echo "0")
+            medium=$(echo "$summary_line"   | jq '.data.vulnerabilities.moderate // 0' 2>/dev/null || echo "0")
+            low=$(echo "$summary_line"      | jq '.data.vulnerabilities.low // 0'      2>/dev/null || echo "0")
+            total=$(echo "$summary_line"    | jq '.data.vulnerabilities | to_entries | map(.value) | add // 0' 2>/dev/null || echo "0")
+
+            print_success "yarn audit complete: $total vulnerabilities"
+
+            CRITICAL_COUNT=$((CRITICAL_COUNT + critical))
+            HIGH_COUNT=$((HIGH_COUNT + high))
+            MEDIUM_COUNT=$((MEDIUM_COUNT + medium))
+            LOW_COUNT=$((LOW_COUNT + low))
+        else
+            print_success "yarn audit complete: no vulnerabilities"
+        fi
+    else
+        print_warning "yarn audit produced no output"
+    fi
+}
+
+# Run pip-audit for Python dependency scanning
+run_pip_audit() {
+    if [ "$SKIP_NPM" = true ]; then
+        # Reuse the --skip-npm flag to also skip pip-audit, keeping it simple
+        return 0
+    fi
+
+    # Detect Python dependency files
+    local has_python_deps=false
+    for f in requirements.txt Pipfile.lock poetry.lock pyproject.toml setup.cfg; do
+        [ -f "$TARGET_DIR/$f" ] && has_python_deps=true && break
+    done
+
+    if [ "$has_python_deps" = false ]; then
+        print_verbose "No Python dependency files found, skipping pip-audit"
+        return 0
+    fi
+
+    print_section "pip-audit Python Dependency Scan"
+
+    if ! command_exists pip-audit; then
+        print_warning "pip-audit not installed, skipping (install: pip install pip-audit)"
+        return 0
+    fi
+
+    local output_file="${OUTPUT_DIR}/pip-audit-${TIMESTAMP}.json"
+
+    print_info "Running pip-audit..."
+
+    # pip-audit can scan a directory for requirement files
+    pip-audit \
+        --format json \
+        --output "$output_file" \
+        --path "$TARGET_DIR" \
+        --no-deps \
+        2>/dev/null || \
+    pip-audit \
+        --format json \
+        --output "$output_file" \
+        -r "$TARGET_DIR/requirements.txt" \
+        2>/dev/null || true
+
+    if [ -f "$output_file" ] && [ -s "$output_file" ]; then
+        local findings
+        findings=$(jq '[.dependencies[]?.vulns[]?] | length' "$output_file" 2>/dev/null || echo "0")
+        print_success "pip-audit complete: $findings vulnerabilities"
+
+        # pip-audit does not emit CVSS severities; count all findings as High for summary purposes
+        HIGH_COUNT=$((HIGH_COUNT + findings))
+
+        print_verbose "  Findings (counted as High): $findings"
+    else
+        print_warning "pip-audit produced no output"
+    fi
+}
+
+# Run OWASP Dependency-Check (Java: pom.xml, Gradle, JARs, WARs, EARs)
+run_dependency_check() {
+    if [ "$SKIP_JAVA" = true ]; then
+        return 0
+    fi
+
+    # Detect Java project files or compiled artifacts
+    local has_java=false
+    if find "$TARGET_DIR" -maxdepth 6 \
+            \( -name "pom.xml" -o -name "build.gradle" -o -name "build.gradle.kts" \
+               -o -name "*.jar" -o -name "*.war" -o -name "*.ear" \) \
+            -print -quit 2>/dev/null | grep -q .; then
+        has_java=true
+    fi
+
+    if [ "$has_java" = false ]; then
+        print_verbose "No Java project files found, skipping OWASP Dependency-Check"
+        return 0
+    fi
+
+    print_section "OWASP Dependency-Check (Java)"
+
+    if ! command_exists dependency-check; then
+        print_warning "OWASP Dependency-Check not installed, skipping (install: ./install.sh)"
+        return 0
+    fi
+
+    # Ensure Java 11+ is available (DC 9+ requirement)
+    local java_ver
+    java_ver=$(java -version 2>&1 | grep -oP '(?<=version ")\d+' | head -n1 || true)
+    [ "$java_ver" = "1" ] && java_ver=$(java -version 2>&1 | grep -oP '(?<=version "1\.)\d+' | head -n1 || true)
+    if [ -z "$java_ver" ] || [ "$java_ver" -lt 11 ] 2>/dev/null; then
+        print_warning "OWASP Dependency-Check requires Java 11+ (found: ${java_ver:-none}), skipping"
+        return 0
+    fi
+
+    local dc_out_dir="${OUTPUT_DIR}/dc-${TIMESTAMP}"
+    local output_file="${OUTPUT_DIR}/dependency-check-${TIMESTAMP}.json"
+
+    print_info "Running OWASP Dependency-Check (first run downloads NVD DB ~300 MB)..."
+    print_info "Tip: set NVD_API_KEY env var to speed up database updates"
+
+    mkdir -p "$dc_out_dir"
+
+    # Build optional NVD API key flag from environment — never hardcoded
+    local nvd_key_flag=()
+    if [ -n "${NVD_API_KEY:-}" ]; then
+        nvd_key_flag=(--nvdApiKey "$NVD_API_KEY")
+        print_verbose "Using NVD API key from NVD_API_KEY environment variable"
+    fi
+
+    dependency-check \
+        --project "scan-$(basename "$TARGET_DIR")" \
+        --scan "$TARGET_DIR" \
+        --format JSON \
+        --out "$dc_out_dir" \
+        --disableAssembly \
+        "${nvd_key_flag[@]}" \
+        2>/dev/null || true
+
+    local dc_report="${dc_out_dir}/dependency-check-report.json"
+    if [ -f "$dc_report" ]; then
+        mv "$dc_report" "$output_file"
+        rm -rf "$dc_out_dir"
+
+        local findings critical high medium low
+        findings=$(jq '[.dependencies[]?.vulnerabilities[]?] | length' "$output_file" 2>/dev/null || echo "0")
+        critical=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity == "CRITICAL")] | length' "$output_file" 2>/dev/null || echo "0")
+        high=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity == "HIGH")] | length' "$output_file" 2>/dev/null || echo "0")
+        medium=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity == "MEDIUM")] | length' "$output_file" 2>/dev/null || echo "0")
+        low=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity == "LOW")] | length' "$output_file" 2>/dev/null || echo "0")
+
+        print_success "OWASP Dependency-Check complete: $findings vulnerabilities"
+
+        CRITICAL_COUNT=$((CRITICAL_COUNT + critical))
+        HIGH_COUNT=$((HIGH_COUNT + high))
+        MEDIUM_COUNT=$((MEDIUM_COUNT + medium))
+        LOW_COUNT=$((LOW_COUNT + low))
+
+        print_verbose "  Critical: $critical, High: $high, Medium: $medium, Low: $low"
+    else
+        print_warning "OWASP Dependency-Check produced no report"
+        rm -rf "$dc_out_dir"
+    fi
+}
+
 # Run license checker
 run_license_check() {
     if [ "$SKIP_LICENSE" = true ]; then
@@ -595,15 +798,28 @@ EOF
     print_success "HTML report generated: $html_file"
 }
 
-# Generate Markdown report
+# Generate Markdown report (timestamped, in output dir — only if --markdown or --all-formats)
 generate_markdown_report() {
     if [ "$GENERATE_MARKDOWN" = false ]; then
         return 0
     fi
 
     print_info "Generating Markdown report..."
-
     local md_file="${OUTPUT_DIR}/REPORT-${TIMESTAMP}.md"
+    _write_markdown_to "$md_file"
+    print_success "Markdown report generated: $md_file"
+}
+
+# Always generate SCAN_RESULTS.md in the invocation directory
+generate_scan_results_md() {
+    local dest="${INVOCATION_DIR}/SCAN_RESULTS.md"
+    _write_markdown_to "$dest"
+    print_success "SCAN_RESULTS.md written to: $dest"
+}
+
+# Internal helper: write a markdown report to a given path
+_write_markdown_to() {
+    local md_file="$1"
 
     cat > "$md_file" << EOF
 # Security Scan Report
@@ -618,10 +834,10 @@ generate_markdown_report() {
 
 | Severity | Count |
 |----------|-------|
-| Critical | $CRITICAL_COUNT |
-| High | $HIGH_COUNT |
-| Medium | $MEDIUM_COUNT |
-| Low | $LOW_COUNT |
+| 🔴 Critical | $CRITICAL_COUNT |
+| 🟠 High | $HIGH_COUNT |
+| 🟡 Medium | $MEDIUM_COUNT |
+| 🟢 Low | $LOW_COUNT |
 
 **Total Issues:** $((CRITICAL_COUNT + HIGH_COUNT + MEDIUM_COUNT + LOW_COUNT))
 
@@ -750,6 +966,68 @@ EOF
         echo "" >> "$md_file"
     fi
 
+    # --- yarn audit findings ---
+    local yarn_file="${OUTPUT_DIR}/yarn-audit-${TIMESTAMP}.json"
+    if [ -f "$yarn_file" ] && [ -s "$yarn_file" ]; then
+        local yarn_advisory_count
+        yarn_advisory_count=$(grep '"type":"auditAdvisory"' "$yarn_file" 2>/dev/null | wc -l | tr -d ' ')
+        echo "## yarn Audit ($yarn_advisory_count advisories)" >> "$md_file"
+        echo "" >> "$md_file"
+        if [ "$yarn_advisory_count" -gt 0 ]; then
+            echo "| Severity | Package | Advisory | URL |" >> "$md_file"
+            echo "|----------|---------|----------|-----|" >> "$md_file"
+            grep '"type":"auditAdvisory"' "$yarn_file" 2>/dev/null | \
+                jq -r '.data.advisory | "| \(.severity | ascii_upcase | gsub("MODERATE"; "MEDIUM")) | `\(.module_name)` | \(.title) | \(.url) |"' \
+                2>/dev/null >> "$md_file"
+        else
+            echo "No vulnerabilities found." >> "$md_file"
+        fi
+        echo "" >> "$md_file"
+        echo "---" >> "$md_file"
+        echo "" >> "$md_file"
+    fi
+
+    # --- pip-audit findings ---
+    local pip_file="${OUTPUT_DIR}/pip-audit-${TIMESTAMP}.json"
+    if [ -f "$pip_file" ] && [ -s "$pip_file" ]; then
+        local pip_count
+        pip_count=$(jq '[.dependencies[]?.vulns[]?] | length' "$pip_file" 2>/dev/null || echo "0")
+        echo "## pip-audit Python Dependency Scan ($pip_count findings)" >> "$md_file"
+        echo "" >> "$md_file"
+        if [ "$pip_count" -gt 0 ]; then
+            echo "| Vulnerability ID | Package | Version | Fix Available | Description |" >> "$md_file"
+            echo "|-----------------|---------|---------|---------------|-------------|" >> "$md_file"
+            jq -r '.dependencies[] | .name as $pkg | .version as $ver | .vulns[]? | "| \(.id) | `\($pkg)` | \($ver) | \(.fix_versions[0] // "N/A") | \(.description[0:100] // "N/A") |"' \
+                "$pip_file" 2>/dev/null >> "$md_file"
+        else
+            echo "No vulnerabilities found." >> "$md_file"
+        fi
+        echo "" >> "$md_file"
+        echo "---" >> "$md_file"
+        echo "" >> "$md_file"
+    fi
+
+    # --- OWASP Dependency-Check (Java) findings ---
+    local dc_file="${OUTPUT_DIR}/dependency-check-${TIMESTAMP}.json"
+    if [ -f "$dc_file" ] && [ -s "$dc_file" ]; then
+        local dc_count
+        dc_count=$(jq '[.dependencies[]?.vulnerabilities[]?] | length' "$dc_file" 2>/dev/null || echo "0")
+        echo "## OWASP Dependency-Check — Java ($dc_count findings)" >> "$md_file"
+        echo "" >> "$md_file"
+        if [ "$dc_count" -gt 0 ]; then
+            echo "| Severity | CVE / ID | Component | Description |" >> "$md_file"
+            echo "|----------|----------|-----------|-------------|" >> "$md_file"
+            jq -r '.dependencies[] | .fileName as $file | .vulnerabilities[]? |
+                "| \(.severity) | \(.name) | `\($file)` | \(.description[0:120] // "N/A") |"' \
+                "$dc_file" 2>/dev/null >> "$md_file"
+        else
+            echo "No vulnerabilities found." >> "$md_file"
+        fi
+        echo "" >> "$md_file"
+        echo "---" >> "$md_file"
+        echo "" >> "$md_file"
+    fi
+
     cat >> "$md_file" << EOF
 ## Next Steps
 
@@ -772,8 +1050,6 @@ EOF
 
 *Report generated by scan-repo v$VERSION*
 EOF
-
-    print_success "Markdown report generated: $md_file"
 }
 
 # Parse command line arguments
@@ -807,10 +1083,11 @@ parse_args() {
             --skip-osv) SKIP_OSV=true; shift ;;
             --skip-grype) SKIP_GRYPE=true; shift ;;
             --skip-npm) SKIP_NPM=true; shift ;;
+            --skip-java) SKIP_JAVA=true; shift ;;
             --skip-license) SKIP_LICENSE=true; shift ;;
             --only-sast)
                 SKIP_TRIVY=true; SKIP_OSV=true; SKIP_GRYPE=true
-                SKIP_NPM=true; SKIP_LICENSE=true
+                SKIP_NPM=true; SKIP_JAVA=true; SKIP_LICENSE=true
                 shift
                 ;;
             --only-deps)
@@ -847,11 +1124,14 @@ parse_args() {
 
 # Main execution
 main() {
+    # Capture the directory from which scan-repo was invoked (for SCAN_RESULTS.md)
+    INVOCATION_DIR="$(pwd)"
+
     # Set defaults
     TARGET_DIR="${TARGET_DIR:-.}"
     OUTPUT_DIR="${OUTPUT_DIR:-$DEFAULT_OUTPUT_DIR}"
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-    
+
     # Resolve to absolute path
     TARGET_DIR=$(cd "$TARGET_DIR" 2>/dev/null && pwd || echo "$TARGET_DIR")
     
@@ -882,12 +1162,17 @@ main() {
     run_osv_scanner
     run_grype
     run_npm_audit
+    run_yarn_audit
+    run_pip_audit
+    run_dependency_check
     run_license_check
     
     # Generate reports
     generate_html_report
     generate_markdown_report
-    
+    # Always write SCAN_RESULTS.md in the directory where scan-repo was invoked
+    generate_scan_results_md
+
     # Show summary
     [ "$QUIET" = false ] && generate_summary
     

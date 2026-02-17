@@ -36,6 +36,7 @@ SKIP_TRIVY=false
 SKIP_OSV=false
 SKIP_GRYPE=false
 SKIP_NODE=false
+SKIP_JAVA=false
 SKIP_SCAN_REPO=false
 
 OS=""
@@ -91,6 +92,7 @@ ${BOLD}Options:${RESET}
   --skip-osv             Skip OSV-Scanner
   --skip-grype           Skip Grype scanner
   --skip-node            Skip Node.js and npm tools (retire, license-checker)
+  --skip-java            Skip OWASP Dependency-Check (Java SCA)
   --skip-scan-repo       Skip installing the scan-repo command itself
   -h, --help             Show this help
 
@@ -112,6 +114,7 @@ parse_args() {
             --skip-osv)        SKIP_OSV=true; shift ;;
             --skip-grype)      SKIP_GRYPE=true; shift ;;
             --skip-node)       SKIP_NODE=true; shift ;;
+            --skip-java)       SKIP_JAVA=true; shift ;;
             --skip-scan-repo)  SKIP_SCAN_REPO=true; shift ;;
             -h|--help)         show_help; exit 0 ;;
             *) die "Unknown option: $1. Use --help for usage." ;;
@@ -312,6 +315,12 @@ install_node() {
     npm_prefix=$(npm config get prefix 2>/dev/null || echo "")
     local npm_bin="${npm_prefix}/bin"
 
+    # Install yarn (for yarn audit support)
+    log_info "Installing yarn..."
+    npm install -g yarn 2>/dev/null \
+        && log_ok  "yarn installed" \
+        || log_warn "yarn installation failed (optional)"
+
     # Install npm tools globally
     log_info "Installing retire.js..."
     npm install -g retire@latest 2>/dev/null \
@@ -322,6 +331,22 @@ install_node() {
     npm install -g license-checker@latest 2>/dev/null \
         && log_ok  "license-checker installed" \
         || log_warn "license-checker installation failed (optional)"
+
+    # Install pip-audit for Python dependency scanning
+    log_info "Installing pip-audit..."
+    if command_exists pip3; then
+        pip3 install pip-audit --break-system-packages 2>/dev/null \
+            || pip3 install pip-audit 2>/dev/null \
+            && log_ok  "pip-audit installed" \
+            || log_warn "pip-audit installation failed (optional, install manually: pip install pip-audit)"
+    elif command_exists pip; then
+        pip install pip-audit --break-system-packages 2>/dev/null \
+            || pip install pip-audit 2>/dev/null \
+            && log_ok  "pip-audit installed" \
+            || log_warn "pip-audit installation failed (optional, install manually: pip install pip-audit)"
+    else
+        log_warn "pip/pip3 not found — skipping pip-audit (install manually: pip install pip-audit)"
+    fi
 
     # Ensure npm global bin is on PATH
     if [[ ":$PATH:" != *":${npm_bin}:"* ]]; then
@@ -561,6 +586,75 @@ install_grype() {
 }
 
 ###############################################################################
+# OWASP Dependency-Check (Java SCA)
+###############################################################################
+
+install_dependency_check() {
+    if [ "$SKIP_JAVA" = true ]; then
+        log_skip "OWASP Dependency-Check (--skip-java)"; return
+    fi
+
+    log_section "Installing OWASP Dependency-Check (Java SCA)"
+
+    # Requires Java 11+
+    local java_ok=false
+    if command_exists java; then
+        local java_ver
+        java_ver=$(java -version 2>&1 | grep -oP '(?<=version ")\d+' | head -n1 || true)
+        # Java versioning: "1.8" = 8, "11" = 11, "17" = 17 etc.
+        [ "$java_ver" = "1" ] && java_ver=$(java -version 2>&1 | grep -oP '(?<=version "1\.)\d+' | head -n1 || true)
+        if [ -n "$java_ver" ] && [ "$java_ver" -ge 11 ] 2>/dev/null; then
+            java_ok=true
+        fi
+    fi
+    if [ "$java_ok" = false ]; then
+        log_warn "Java 11+ not found — skipping OWASP Dependency-Check"
+        log_warn "Install openjdk-11-jdk and re-run to enable Java dependency scanning"
+        return
+    fi
+
+    if command_exists dependency-check; then
+        log_ok "OWASP Dependency-Check already installed"
+        return
+    fi
+
+    # Try GitHub API first; fall back to a pinned known-good version
+    local version
+    version=$(curl -s --max-time 10 "https://api.github.com/repos/jeremylong/DependencyCheck/releases/latest" \
+        | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/' | head -n1 || true)
+    if [ -z "$version" ]; then
+        version="12.1.0"   # last confirmed good release (11.x fails on NVD CVSS v4 SAFETY enum)
+    fi
+
+    local url="https://github.com/jeremylong/DependencyCheck/releases/download/v${version}/dependency-check-${version}-release.zip"
+    local zip_file="/tmp/dependency-check-${version}.zip"
+    local install_dir="/opt/dependency-check"
+
+    log_info "Downloading OWASP Dependency-Check v${version}..."
+    curl -fsSL "$url" -o "$zip_file" || {
+        log_warn "Download failed. See https://github.com/jeremylong/DependencyCheck/releases"
+        return
+    }
+
+    log_info "Extracting to ${install_dir}..."
+    $SUDO mkdir -p /opt
+    $SUDO unzip -q "$zip_file" -d /opt/
+    $SUDO chmod +x "${install_dir}/bin/dependency-check.sh"
+
+    # Symlink into the install prefix
+    $SUDO ln -sf "${install_dir}/bin/dependency-check.sh" "${INSTALL_PREFIX}/dependency-check"
+
+    rm -f "$zip_file"
+
+    if command_exists dependency-check; then
+        log_ok "OWASP Dependency-Check v${version} installed"
+        log_info "Note: First scan will download the NVD database (~300 MB, ~15 min)"
+    else
+        log_warn "OWASP Dependency-Check installation may have failed"
+    fi
+}
+
+###############################################################################
 # scan-repo itself
 ###############################################################################
 
@@ -609,6 +703,9 @@ verify_installations() {
         "npm:npm"
         "retire:retire.js"
         "license-checker:license-checker"
+        "pip-audit:pip-audit (Python dep scanner)"
+        "dependency-check:OWASP Dependency-Check (Java)"
+        "yarn:yarn (optional, for yarn audit)"
         "jq:jq (JSON processor)"
     )
 
@@ -686,7 +783,10 @@ print_plan() {
     [ "$SKIP_TRIVY"      = false ] && echo "  • Trivy          — SCA + IaC misconfiguration scanner"
     [ "$SKIP_OSV"        = false ] && echo "  • OSV-Scanner    — dependency vulnerability database"
     [ "$SKIP_GRYPE"      = false ] && echo "  • Grype          — container + filesystem vulnerability scanner"
-    [ "$SKIP_NODE"       = false ] && echo "  • Node.js / npm  — runtime for retire.js and license-checker"
+    [ "$SKIP_NODE"       = false ] && echo "  • Node.js / npm  — runtime for retire.js, yarn, and license-checker"
+    [ "$SKIP_NODE"       = false ] && echo "  • yarn           — yarn audit for yarn.lock projects"
+    [ "$SKIP_NODE"       = false ] && echo "  • pip-audit      — Python dependency vulnerability scanner"
+    [ "$SKIP_JAVA"       = false ] && echo "  • OWASP DC       — Java SCA (pom.xml, Gradle, JARs, WARs)"
     [ "$SKIP_SCAN_REPO"  = false ] && echo "  • scan-repo      — the main scanner command"
     echo ""
 }
@@ -711,6 +811,7 @@ main() {
     install_trivy
     install_osv_scanner
     install_grype
+    install_dependency_check
     install_scan_repo
     update_shell_path
 
